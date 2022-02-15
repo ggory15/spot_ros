@@ -1064,14 +1064,13 @@ class SpotWrapper():
     def dock(self, dock_id):
         "Dock the robot to dockid"
         try:
-            with self._lease_keepalive:
-                # make sure we're powered on and standing
-                self.power_on()
-                self.stand()
-                # Dock the robot
-                self._blocking_dock_robot(dock_id)
-                # Sit after Dock
-                self.sit()
+            # make sure we're powered on and standing
+            self.power_on()
+            self.stand()
+            # Dock the robot
+            self._blocking_dock_robot(dock_id)
+            # Sit after Dock
+            self.sit()
             return True, "Success"
         except Exception as e:
             return False, str(e)
@@ -1080,11 +1079,10 @@ class SpotWrapper():
     def undock(self, timeout=20):
         "Power motor on and undock the robot from the station"
         try:
-            with self._lease_keepalive:
-                # Undock the robot
-                self._blocking_undock(timeout)
-                # Stand after Undock
-                self.stand()
+            # Undock the robot
+            self._blocking_undock(timeout)
+            # Stand after Undock
+            self.stand()
             return True, "Success"
         except Exception as e:
             return False, str(e)
