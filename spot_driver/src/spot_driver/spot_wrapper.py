@@ -1064,8 +1064,8 @@ class SpotWrapper():
     def dock(self, dock_id):
         "Dock the robot to dockid"
         try:
-            # make sure we're powered on and standing
-            self.power_on()
+            # おまじない.これをするとLease Errorがでなくなる
+            self.sit()
             self.stand()
             # Dock the robot
             self._blocking_dock_robot(dock_id)
