@@ -1,6 +1,12 @@
 import time
 import math
 import os
+from bosdyn.client.spot_cam.ptz import PtzClient
+
+import cv2
+import numpy as np
+
+from bosdyn import geometry
 
 from bosdyn.client import create_standard_sdk, ResponseError, RpcError
 from bosdyn.client.async_tasks import AsyncPeriodicQuery, AsyncTasks
@@ -16,6 +22,12 @@ from bosdyn.client.power import safe_power_off, PowerClient, power_on
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.image import ImageClient, build_image_request
 from bosdyn.client.docking import DockingClient
+from bosdyn.client.manipulation_api_client import ManipulationApiClient
+from bosdyn.client.door import DoorClient
+from bosdyn.client import spot_cam
+from bosdyn.client.spot_cam.compositor import CompositorClient
+from bosdyn.client.spot_cam.ptz import PtzClient
+
 from bosdyn.client.common import (BaseClient, common_header_errors, common_lease_errors,
                                   error_factory, handle_common_header_errors,
                                   handle_lease_use_result_errors, handle_unset_status_error,
@@ -38,7 +50,18 @@ from . import graph_nav_util
 
 import bosdyn.api.robot_state_pb2 as robot_state_proto
 from bosdyn.api import basic_command_pb2
+from bosdyn.api import robot_command_pb2
+from bosdyn.api import arm_command_pb2, trajectory_pb2, synchronized_command_pb2
+from bosdyn.api import geometry_pb2
+from bosdyn.api.spot import door_pb2
+from bosdyn.api.manipulation_api_pb2 import WalkToObjectInImage, ManipulationApiRequest, ManipulationApiFeedbackRequest
+from bosdyn.api.spot_cam import ptz_pb2
+
+from bosdyn.util import seconds_to_duration
+from bosdyn.client.frame_helpers import *
+
 from google.protobuf.timestamp_pb2 import Timestamp
+
 
 front_image_sources = ['frontleft_fisheye_image', 'frontright_fisheye_image', 'frontleft_depth', 'frontright_depth']
 """List of image sources for front image periodic query"""
@@ -46,6 +69,11 @@ side_image_sources = ['left_fisheye_image', 'right_fisheye_image', 'left_depth',
 """List of image sources for side image periodic query"""
 rear_image_sources = ['back_fisheye_image', 'back_depth']
 """List of image sources for rear image periodic query"""
+hand_image_sources = ['hand_image', 'hand_depth']
+"""List of image sources for hand image periodic query"""
+
+cam_screen_sources = ['pano_full', 'digi', 'digi_overlay', 'digi_full', 'c0', 'c1', 'c2', 'c3', 'c4', 'mech', 'mech_full', 'mech_overlay', 'mech_ir', 'mech_full_ir']
+
 
 class AsyncRobotState(AsyncPeriodicQuery):
     """Class to get robot state at regular intervals.  get_robot_state_async query sent to the robot at every tick.  Callback registered to defined callback function.
@@ -222,15 +250,223 @@ class AsyncIdle(AsyncPeriodicQuery):
         if self._spot_wrapper.is_standing and not self._spot_wrapper.is_moving:
             self._spot_wrapper.stand(False)
 
+class AsyncScreenState(AsyncPeriodicQuery):
+    """Class to get screen state at regular intervals. Callback registered to defined callback function.
+
+        Attributes:
+            client: The Client to a service on the robot
+            logger: Logger object
+            rate: Rate (Hz) to trigger the query
+            callback: Callback function to call when the results of the query are available
+    """
+    def __init__(self, client, logger, rate, callback):
+        super(AsyncScreenState, self).__init__("spot-cam-screen", client, logger,
+                                           period_sec=1.0/max(rate, 1.0))
+        self._callback = None
+        if rate > 0.0:
+            self._callback = callback
+
+    def _start_query(self):
+        if self._callback:
+            callback_future = self._client.get_screen_async()
+            callback_future.add_done_callback(self._callback)
+            return callback_future
+
+class AsyncPTZState(AsyncPeriodicQuery):
+    """Class to get ptz state at regular intervals. Callback registered to defined callback function.
+
+        Attributes:
+            client: The Client to a service on the robot
+            logger: Logger object
+            rate: Rate (Hz) to trigger the query
+            callback: Callback function to call when the results of the query are available
+    """
+    def __init__(self, client, logger, rate, callback):
+        super(AsyncPTZState, self).__init__("spot-cam-ptz", client, logger,
+                                           period_sec=1.0/max(rate, 1.0))
+        self._callback = None
+        if rate > 0.0:
+            self._callback = callback
+
+    def _start_query(self):
+        if self._callback:
+            ptz_desc = ptz_pb2.PtzDescription(name='mech')
+            callback_future = self._client.get_ptz_position_async(ptz_desc)
+            callback_future.add_done_callback(self._callback)
+            return callback_future
+
+class RequestManager:
+    """Helper object for displaying side by side images to the user and requesting user selected
+    touchpoints. This class handles the bookkeeping for converting between a touchpoints of side by
+    side display image of the frontleft and frontright fisheye images and the individual images.
+
+    Args:
+        image_dict: (dict) Dictionary from image source name to (image proto, CV2 image) pairs.
+        window_name: (str) Name of display window..
+    """
+
+    def __init__(self, image_dict, window_name):
+        self.image_dict = image_dict
+        self.window_name = window_name
+        self.handle_position_side_by_side = None
+        self.hinge_position_side_by_side = None
+        self._side_by_side = None
+        self.clicked_source = None
+
+    @property
+    def side_by_side(self):
+        """cv2.Image: Side by side rotated frontleft and frontright fisheye images"""
+        if self._side_by_side is not None:
+            return self._side_by_side
+
+        # Convert PIL images to numpy for processing.
+        fr_fisheye_image = self.image_dict['frontright_fisheye_image'][1]
+        fl_fisheye_image = self.image_dict['frontleft_fisheye_image'][1]
+
+        # Rotate the images to align with robot Z axis.
+        fr_fisheye_image = cv2.rotate(fr_fisheye_image, cv2.ROTATE_90_CLOCKWISE)
+        fl_fisheye_image = cv2.rotate(fl_fisheye_image, cv2.ROTATE_90_CLOCKWISE)
+
+        self._side_by_side = np.hstack([fr_fisheye_image, fl_fisheye_image])
+
+        return self._side_by_side
+
+    def user_input_set(self):
+        """bool: True if handle and hinge position set."""
+        return (self.handle_position_side_by_side and self.hinge_position_side_by_side)
+
+    def _on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if not self.handle_position_side_by_side:
+                cv2.circle(self.side_by_side, (x, y), 30, (255, 0, 0), 5)
+                _draw_text_on_image(self.side_by_side, "Click hinge.")
+                cv2.imshow(self.window_name, self.side_by_side)
+                self.handle_position_side_by_side = (x, y)
+            elif not self.hinge_position_side_by_side:
+                self.hinge_position_side_by_side = (x, y)
+
+    def get_user_input_handle_and_hinge(self):
+        """Open window showing the side by side fisheye images with on screen prompts for user."""
+        _draw_text_on_image(self.side_by_side, "Click handle.")
+        cv2.imshow(self.window_name, self.side_by_side)
+        cv2.setMouseCallback(self.window_name, self._on_mouse)
+        while not self.user_input_set():
+            cv2.waitKey(1)
+        cv2.destroyAllWindows()
+
+    def get_walk_to_object_in_image_request(self, debug):
+        """Convert from touchpoints in side by side image to a WalkToObjectInImage request.
+        Optionally show debug image of touch point.
+
+        Args:
+            debug (bool): Show intermediate debug image..
+
+        Returns:
+            ManipulationApiRequest: Request with WalkToObjectInImage info populated.
+        """
+
+        # Figure out which source the user actually clicked.
+        height, width = self.side_by_side.shape
+        if self.handle_position_side_by_side[0] > width / 2:
+            self.clicked_source = "frontleft_fisheye_image"
+            rotated_pixel = self.handle_position_side_by_side
+            rotated_pixel = (rotated_pixel[0] - width / 2, rotated_pixel[1])
+        else:
+            self.clicked_source = "frontright_fisheye_image"
+            rotated_pixel = self.handle_position_side_by_side
+
+        # Undo pixel rotation by rotation 90 deg CCW.
+        manipulation_cmd = WalkToObjectInImage()
+        th = -math.pi / 2
+        xm = width / 4
+        ym = height / 2
+        x = rotated_pixel[0] - xm
+        y = rotated_pixel[1] - ym
+        manipulation_cmd.pixel_xy.x = math.cos(th) * x - math.sin(th) * y + ym
+        manipulation_cmd.pixel_xy.y = math.sin(th) * x + math.cos(th) * y + xm
+
+        # Optionally show debug image.
+        if debug:
+            clicked_cv2 = self.image_dict[self.clicked_source][1]
+            c = (255, 0, 0)
+            cv2.circle(clicked_cv2,
+                       (int(manipulation_cmd.pixel_xy.x), int(manipulation_cmd.pixel_xy.y)), 30, c,
+                       5)
+            cv2.imshow("Debug", clicked_cv2)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+        # Populate the rest of the Manip API request.
+        clicked_image_proto = self.image_dict[self.clicked_source][0]
+        manipulation_cmd.frame_name_image_sensor = clicked_image_proto.shot.frame_name_image_sensor
+        manipulation_cmd.transforms_snapshot_for_camera.CopyFrom(
+            clicked_image_proto.shot.transforms_snapshot)
+        manipulation_cmd.camera_model.CopyFrom(clicked_image_proto.source.pinhole)
+        door_search_dist_meters = 1.25
+        manipulation_cmd.offset_distance.value = door_search_dist_meters
+
+        request = ManipulationApiRequest(walk_to_object_in_image=manipulation_cmd)
+        return request
+
+    @property
+    def vision_tform_sensor(self):
+        """Look up vision_tform_sensor for sensor which user clicked.
+
+        Returns:
+            math_helpers.SE3Pose
+        """
+        clicked_image_proto = self.image_dict[self.clicked_source][0]
+        frame_name_image_sensor = clicked_image_proto.shot.frame_name_image_sensor
+        snapshot = clicked_image_proto.shot.transforms_snapshot
+        return frame_helpers.get_a_tform_b(snapshot, frame_helpers.VISION_FRAME_NAME,
+                                           frame_name_image_sensor)
+
+    @property
+    def hinge_side(self):
+        """Calculate if hinge is on left or right side of door based on user touchpoints.
+
+        Returns:
+            DoorCommand.HingeSide
+        """
+        handle_x = self.handle_position_side_by_side[0]
+        hinge_x = self.hinge_position_side_by_side[0]
+        if handle_x < hinge_x:
+            hinge_side = door_pb2.DoorCommand.HINGE_SIDE_RIGHT
+        else:
+            hinge_side = door_pb2.DoorCommand.HINGE_SIDE_LEFT
+        return hinge_side
+
+
+def _draw_text_on_image(image, text):
+    font_scale = 4
+    thickness = 4
+    font = cv2.FONT_HERSHEY_PLAIN
+    (text_width, text_height) = cv2.getTextSize(text, font, fontScale=font_scale,
+                                                thickness=thickness)[0]
+
+    rectangle_bgr = (255, 255, 255)
+    text_offset_x = 10
+    text_offset_y = image.shape[0] - 25
+    border = 10
+    box_coords = ((text_offset_x - border, text_offset_y + border),
+                  (text_offset_x + text_width + border, text_offset_y - text_height - border))
+    cv2.rectangle(image, box_coords[0], box_coords[1], rectangle_bgr, cv2.FILLED)
+    cv2.putText(image, text, (text_offset_x, text_offset_y), font, fontScale=font_scale,
+                color=(0, 0, 0), thickness=thickness)
+
 class SpotWrapper():
     """Generic wrapper class to encompass release 1.1.4 API features as well as maintaining leases automatically"""
-    def __init__(self, username, password, hostname, logger, rates = {}, callbacks = {}):
+    def __init__(self, username, password, hostname, logger, estop_timeout=9.0, dock_id=520, has_arm=False, has_cam=False, rates = {}, callbacks = {}):
         self._username = username
         self._password = password
         self._hostname = hostname
         self._logger = logger
         self._rates = rates
         self._callbacks = callbacks
+        self._estop_timeout = estop_timeout
+        self._dock_id = dock_id
+        self._has_arm = has_arm
+        self._has_cam = has_cam
         self._keep_alive = True
         self._valid = True
 
@@ -266,8 +502,11 @@ class SpotWrapper():
             self._valid = False
             return
 
-        self._robot = self._sdk.create_robot(self._hostname)
+        if self._has_cam:
+            spot_cam.register_all_service_clients(self._sdk)            
 
+        self._robot = self._sdk.create_robot(self._hostname)
+        
         try:
             self._robot.authenticate(self._username, self._password)
             self._robot.start_time_sync()
@@ -289,6 +528,10 @@ class SpotWrapper():
                 self._image_client = self._robot.ensure_client(ImageClient.default_service_name)
                 self._estop_client = self._robot.ensure_client(EstopClient.default_service_name)
                 self._docking_client = self._robot.ensure_client(DockingClient.default_service_name)
+                self._manipulation_client = None
+                self._door_client = None
+                self._compositor_client = None
+                self._ptz_client = None
             except Exception as e:
                 self._logger.error("Unable to create client service: %s", e)
                 self._valid = False
@@ -309,7 +552,10 @@ class SpotWrapper():
             self._front_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("front_image", 0.0)), self._callbacks.get("front_image", lambda: None), self._front_image_requests)
             self._side_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("side_image", 0.0)), self._callbacks.get("side_image", lambda: None), self._side_image_requests)
             self._rear_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("rear_image", 0.0)), self._callbacks.get("rear_image", lambda: None), self._rear_image_requests)
+            self._hand_image_task = None
             self._idle_task = AsyncIdle(self._robot_command_client, self._logger, 10.0, self)
+            self._screen_state_task = None
+            self._ptz_state_task = None
 
             self._estop_endpoint = None
 
@@ -318,6 +564,37 @@ class SpotWrapper():
 
             self._robot_id = None
             self._lease = None
+
+            # Stot Arm
+            if self._has_arm:
+                self._hand_image_requests = []
+                for source in hand_image_sources:
+                    self._hand_image_requests.append(build_image_request(source, image_format=image_pb2.Image.FORMAT_RAW))
+                self._hand_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("hand_image", 0.0)), self._callbacks.get("hand_image", lambda:None), self._hand_image_requests)
+                self._async_tasks.add_task(self._hand_image_task)
+
+                try:
+                    self._manipulation_client = self._robot.ensure_client(ManipulationApiClient.default_service_name)
+                    self._door_client = self._robot.ensure_client(DoorClient.default_service_name)
+                except Exception as e:
+                    self._logger.error("Unable to create client service: %s", e)
+                    self._valid = False
+                    return
+
+            # Spot Cam
+            if self._has_cam:
+                try:
+                    self._compositor_client = self._robot.ensure_client(CompositorClient.default_service_name)
+                    self._ptz_client = self._robot.ensure_client(PtzClient.default_service_name)
+                except Exception as e:
+                    self._logger.error("Unable to create client service: %s", e)
+                    self._valid = False
+                    return
+
+                self._screen_state_task = AsyncScreenState(self._compositor_client, self._logger, max(0.0, self._rates.get("cam_state", 0.0)), self._callbacks.get("screen_state", lambda:None))
+                self._ptz_state_task = AsyncPTZState(self._ptz_client, self._logger, max(0.0, self._rates.get("cam_state", 0.0)), self._callbacks.get("ptz_state", lambda:None))
+                self._async_tasks.add_task(self._screen_state_task)
+                self._async_tasks.add_task(self._ptz_state_task)
 
     @property
     def logger(self):
@@ -363,6 +640,21 @@ class SpotWrapper():
     def rear_images(self):
         """Return latest proto from the _rear_image_task"""
         return self._rear_image_task.proto
+
+    @property
+    def hand_images(self):
+        """Return latest proto from the _hand_image_task"""
+        return self._hand_image_task.proto
+
+    @property
+    def screen_state(self):
+        """Return latest proto from the _screen_state_task"""
+        return self._screen_state_task.proto
+
+    @property
+    def ptz_state(self):
+        """Return latest proto from the _ptz_state_task"""
+        return self._ptz_state_task.proto
 
     @property
     def is_standing(self):
@@ -1087,6 +1379,252 @@ class SpotWrapper():
         except Exception as e:
             return False, str(e)
 
+    def stow(self):
+        """Stow the arm."""
+        if self._robot.has_arm():
+            response = self._robot_command(RobotCommandBuilder.arm_stow_command())
+            return response[0], response[1]
+        else:
+            return False, "Robot don't have the arm."
+
+    def unstow(self):
+        """Unstow the arm."""
+        if self._robot.has_arm():
+            response = self._robot_command(RobotCommandBuilder.arm_ready_command())
+            return response[0], response[1]
+        else:
+            return False, "Robot don't have the arm."
+
+    def gipper_open(self):
+        """Gripper is opened."""
+        if self._robot.has_arm():
+            response = self._robot_command(RobotCommandBuilder.claw_gripper_open_command())
+            return response[0], response[1]
+        else:
+            return False, "Robot don't have the arm."
+
+    def gipper_close(self):
+        """Gripper is closeed."""
+        if self._robot.has_arm():
+            response = self._robot_command(RobotCommandBuilder.claw_gripper_close_command())
+            return response[0], response[1]
+        else:
+            return False, "Robot don't have the arm."
+
+    def pitch_up(self):
+        """Pitch robot up to look for door handle."""
+        self._logger.info("Pitching robot up...")
+        footprint_R_body = geometry.EulerZXY(0.0, 0.0, -1 * math.pi / 6.0)
+        response = self._robot_command(RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body))
+        timeout_sec = 10.0
+        end_time = time.time() + timeout_sec
+        while time.time() < end_time:
+            command_feedback = self._robot_command_client.robot_command_feedback(response[2])
+            synchronized_feedback = command_feedback.feedback.synchronized_feedback
+            status = synchronized_feedback.mobility_command_feedback.stand_feedback.status
+            if (status == basic_command_pb2.StandCommand.Feedback.STATUS_IS_STANDING):
+                self._logger.info("Robot pitched.")
+                return
+            time.sleep(1.0)
+        raise Exception("Failed to pitch robot.")
+
+    def get_images_as_cv2(self, sources):
+        """Request image sources from robot. Decode and store as OpenCV image as well as proto.
+        Args:
+            sources: (list) String names of image sources.
+
+        Returns:
+            dict: Dictionary from image source name to (image proto, CV2 image) pairs.
+        """
+        image_responses = self._image_client.get_image_from_sources(sources)
+        image_dict = dict()
+        for response in image_responses:
+            # Convert image proto to CV2 image, for display later.
+            image = np.frombuffer(response.shot.image.data, dtype=np.uint8)
+            image = cv2.imdecode(image, -1)
+            image_dict[response.source.name] = (response, image)
+        return image_dict
+
+    def walk_to_object_in_image(self, request_manager, debug):
+        """Command the robot to walk toward user selected point. The WalkToObjectInImage feedback
+        reports a raycast result, converting the 2D touchpoint to a 3D location in space.
+
+        Args:
+            request_manager: (RequestManager) Object for bookkeeping user touch points.
+            debug (bool): Show intermediate debug image..
+
+        Returns:
+            ManipulationApiResponse: Feedback from WalkToObjectInImage request.
+        """
+        manipulation_api_request = request_manager.get_walk_to_object_in_image_request(debug)
+
+        # Send a manipulation API request. Using the points selected by the user, the robot will
+        # walk toward the door handle.
+        self._logger.info("Walking toward door...")
+        response = self._manipulation_client.manipulation_api_command(manipulation_api_request)
+
+        # Check feedback to verify the robot walks to the handle. The service will also return a
+        # FrameTreeSnapshot that contain a walkto_raycast_intersection point.
+        command_id = response.manipulation_cmd_id
+        feedback_request = ManipulationApiFeedbackRequest(manipulation_cmd_id=command_id)
+        timeout_sec = 15.0
+        end_time = time.time() + timeout_sec
+        while time.time() < end_time:
+            response = self._manipulation_client.manipulation_api_feedback_command(feedback_request)
+            assert response.manipulation_cmd_id == command_id, "Got feedback for wrong command."
+            if (response.current_state == manipulation_api_pb2.MANIP_STATE_DONE):
+                return response
+        raise Exception("Manipulation command timed out. Try repositioning the robot.")
+
+    def open_door(self, request_manager, snapshot):
+        """Command the robot to automatically open a door via the door service API.
+
+        Args:
+            request_manager: (RequestManager) Object for bookkeeping user touch points.
+            snapshot: (TransformSnapshot) Snapshot from the WalkToObjectInImage command which contains
+                the 3D location reported from a raycast based on the user hinge touch point.
+        """
+        self._logger.info("Opening door...")
+
+        # Using the raycast intersection point and the
+        vision_tform_raycast = frame_helpers.get_a_tform_b(snapshot, frame_helpers.VISION_FRAME_NAME,
+                                                        frame_helpers.RAYCAST_FRAME_NAME)
+        vision_tform_sensor = request_manager.vision_tform_sensor
+        raycast_point_wrt_vision = vision_tform_raycast.get_translation()
+        ray_from_camera_to_object = raycast_point_wrt_vision - vision_tform_sensor.get_translation()
+        ray_from_camera_to_object_norm = np.sqrt(np.sum(ray_from_camera_to_object**2))
+        ray_from_camera_normalized = ray_from_camera_to_object / ray_from_camera_to_object_norm
+
+        auto_cmd = door_pb2.DoorCommand.AutoGraspCommand()
+        auto_cmd.frame_name = frame_helpers.VISION_FRAME_NAME
+        search_dist_meters = 0.25
+        search_ray = search_dist_meters * ray_from_camera_normalized
+        search_ray_start_in_frame = raycast_point_wrt_vision - search_ray
+        auto_cmd.search_ray_start_in_frame.CopyFrom(geometry_pb2.Vec3(x=search_ray_start_in_frame[0], 
+                                                    y=search_ray_start_in_frame[1], z=search_ray_start_in_frame[2]))
+
+        search_ray_end_in_frame = raycast_point_wrt_vision + search_ray
+        auto_cmd.search_ray_end_in_frame.CopyFrom(geometry_pb2.Vec3(x=search_ray_end_in_frame[0], 
+                                                    y=search_ray_end_in_frame[1], z=search_ray_end_in_frame[2]))
+
+        auto_cmd.hinge_side = request_manager.hinge_side
+        auto_cmd.swing_direction = door_pb2.DoorCommand.SWING_DIRECTION_UNKNOWN
+
+        door_command = door_pb2.DoorCommand.Request(auto_grasp_command=auto_cmd)
+        request = door_pb2.OpenDoorCommandRequest(door_command=door_command)
+
+        # Command the robot to open the door.
+        response = self._door_client.open_door(request)
+
+        feedback_request = door_pb2.OpenDoorFeedbackRequest()
+        feedback_request.door_command_id = response.door_command_id
+
+        timeout_sec = 60.0
+        end_time = time.time() + timeout_sec
+        while time.time() < end_time:
+            feedback_response = self._door_client.open_door_feedback(feedback_request)
+            if (feedback_response.status !=
+                    basic_command_pb2.RobotCommandFeedbackStatus.STATUS_PROCESSING):
+                raise Exception("Door command reported status ")
+            if (feedback_response.feedback.status == door_pb2.DoorCommand.Feedback.STATUS_COMPLETED):
+                self._logger.info("Opened door.")
+                return
+            time.sleep(0.5)
+        raise Exception("Door command timed out. Try repositioning the robot.")
+ 
+    def execute_open_door(self, debug=False):
+        """High level behavior sequence for commanding the robot to open a door."""
+        # Pitch the robot up.
+        try:
+            self.pitch_up()
+        except Exception as e:
+            return False, str(e)
+
+        # Capture images from the two from cameras.
+        image_dict = self.get_images_as_cv2(['frontleft_fisheye_image', 'frontright_fisheye_image'])
+
+        # Get handle and hinge locations from user input.
+        window_name = "Open Door Example"
+        request_manager = RequestManager(image_dict, window_name)
+        request_manager.get_user_input_handle_and_hinge()
+        assert request_manager.user_input_set(), "Failed to get user input for handle and hinge."
+
+        try:
+            # Tell the robot to walk toward the door.
+            manipulation_feedback = self.walk_to_object_in_image(request_manager, debug)
+            time.sleep(3.0)
+        except Exception as e:
+            return False, str(e)
+
+        # The ManipulationApiResponse for the WalkToObjectInImage command returns a transform snapshot
+        # that contains where user clicked door handle point intersects the world. We use this
+        # intersection point to execute the door command.
+        snapshot = manipulation_feedback.transforms_snapshot_manipulation_data
+
+        try:
+            self.open_door(request_manager, snapshot)
+            time.sleep(3.0)
+        except Exception as e:
+            return False, str(e)
+    
+    def open_door_main(self):
+        """Opening the door"""
+        try:
+            with LeaseKeepAlive(self._lease_client):
+                self.execute_open_door()
+                return True, "Success"
+        except Exception as e:
+            return False, str(e)
+
+    def set_screen(self, screen):
+        """Set the cam screen"""
+        if self._has_cam:
+            if screen in cam_screen_sources:
+                self._compositor_client.set_screen(screen)
+                return True, "Success"
+            else:
+                return False, "Invalid screen. " + "Screen list is " + str(cam_screen_sources)
+        else:
+            return False, "Robot don't have the spot cam."
+
+    def control_cam_ptz(self, pan, tilt, zoom):
+        """Control the cam ptz"""
+        if self._has_cam:
+            if pan < 0 or pan > 360 or tilt < -90 or tilt > 90 or zoom < 1 or zoom > 30:
+                return False, "Invalid command value"
+            else:
+                ptz_desc = ptz_pb2.PtzDescription(name='mech')
+                self._ptz_client.set_ptz_position(ptz_desc, pan, tilt, zoom)
+                return True, "Success"
+        else:
+            return False, "Robot don't have the spot cam."
+
+    def arm_cartesian(self, goal):
+        """Move the arm to the commanded cartesian position"""
+        robot_command.blocking_stand(self._robot_command_client)
+
+        pose = geometry_pb2.Vec3(x = goal.target.position.x,
+                                    y = goal.target.position.y,
+                                    z = goal.target.position.z)
+        quat = geometry_pb2.Quaternion(x = goal.target.orientation.x,
+                                 y = goal.target.orientation.y,
+                                 z = goal.target.orientation.z,
+                                 w = goal.target.orientation.w)
+        flat_body_T_hand = geometry_pb2.SE3Pose(position=pose, rotation=quat)
+
+        robot_state = self._robot_state_client.get_robot_state()
+        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                         ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        odom_T_hand = odom_T_flat_body * math_helpers.SE3Pose.from_obj(flat_body_T_hand) 
+
+        try:
+            response = self._robot_command(RobotCommandBuilder.arm_pose_command(
+                odom_T_hand.x, odom_T_hand.y, odom_T_hand.z, 
+                odom_T_hand.rot.w, odom_T_hand.rot.x, odom_T_hand.rot.y, odom_T_hand.rot.z, 
+                ODOM_FRAME_NAME, 3))
+            return response[0], response[1], response[2]
+        except Exception as e:
+            return False, str(e)
 
     def _blocking_dock_robot(self, dock_id, num_retries=4, timeout=30):
 

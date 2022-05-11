@@ -1,3 +1,4 @@
+from math import pi
 import rospy
 
 from std_srvs.srv import Trigger, TriggerResponse, SetBool, SetBoolResponse
@@ -31,10 +32,14 @@ from spot_msgs.msg import Feedback
 from spot_msgs.msg import MobilityParams
 from spot_msgs.msg import NavigateToAction, NavigateToResult, NavigateToFeedback
 from spot_msgs.msg import TrajectoryAction, TrajectoryResult, TrajectoryFeedback
+from spot_msgs.msg import CartesianAction, CartesianResult, CartesianFeedback
+from spot_msgs.msg import CamState, ScreenState, PTZState
 from spot_msgs.srv import ListGraph, ListGraphResponse
 from spot_msgs.srv import SetLocomotion, SetLocomotionResponse
 from spot_msgs.srv import ClearBehaviorFault, ClearBehaviorFaultResponse
 from spot_msgs.srv import SetVelocity, SetVelocityResponse
+from spot_msgs.srv import SetPTZ, SetPTZResponse
+from spot_msgs.srv import SetScreen, SetScreenResponse
 from spot_msgs.srv import UploadGraph, UploadGraphResponse
 from spot_msgs.srv import SetLocalizationFiducial, SetLocalizationFiducialResponse
 from spot_msgs.srv import SetLocalizationWaypoint, SetLocalizationWaypointResponse
@@ -62,6 +67,9 @@ class SpotROS():
         self.callbacks["front_image"] = self.FrontImageCB
         self.callbacks["side_image"] = self.SideImageCB
         self.callbacks["rear_image"] = self.RearImageCB
+        self.callbacks["hand_image"] = self.HandImageCB
+        self.callbacks["screen_state"] = self.ScreenStateCB
+        self.callbacks["ptz_state"] = self.PTZStateCB
 
     def RobotStateCB(self, results):
         """Callback for when the Spot Wrapper gets new robot state data.
@@ -238,6 +246,46 @@ class SpotROS():
 
             self.populate_camera_static_transforms(data[0])
             self.populate_camera_static_transforms(data[1])
+
+    def HandImageCB(self, results):
+        """Callback for when the Spot Wrapper gets new ptz state data.
+
+        Args:
+            results: FutureWrapper object of AsyncPeriodicQuery callback
+        """
+        data = self.spot_wrapper.hand_images
+        if data:
+            image_msg0, camera_info_msg0 = getImageMsg(data[0], self.spot_wrapper)
+            self.hand_image_pub.publish(image_msg0)
+            self.hand_image_info_pub.publish(camera_info_msg0)
+            image_msg1, camera_info_msg1 = getImageMsg(data[1], self.spot_wrapper)
+            self.hand_depth_pub.publish(image_msg1)
+            self.hand_depth_info_pub.publish(camera_info_msg1)
+
+            self.populate_camera_static_transforms(data[0])
+            self.populate_camera_static_transforms(data[1])
+    
+    def ScreenStateCB(self, results):
+        """Callback for when the Spot Wrapper gets new cam sceen state data.
+
+        Args:
+            results: FutureWrapper object of AsyncPeriodicQuery callback
+        """
+        state = self.spot_wrapper.screen_state
+        if state:
+            self.cam_state.screen_state.screen = state
+
+    def PTZStateCB(self, results):
+        """Callback for when the Spot Wrapper gets new cam ptz state data.
+
+        Args:
+            results: FutureWrapper object of AsyncPeriodicQuery callback
+        """
+        state = self.spot_wrapper.ptz_state
+        if state:
+            self.cam_state.ptz_state.pan = state.pan.value
+            self.cam_state.ptz_state.tilt = state.tilt.value
+            self.cam_state.ptz_state.zoom = state.zoom.value
 
     def handle_claim(self, req):
         """ROS service handler for the claim service"""
@@ -432,6 +480,41 @@ class SpotROS():
         mobility_params.body_control.CopyFrom(body_control)
         self.spot_wrapper.set_mobility_params(mobility_params)
 
+    def handle_stow(self, req):
+        """ROS service handler for stowing the arm"""
+        resp = self.spot_wrapper.stow()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_unstow(self, req):
+        """ROS service handler for unstowing the arm"""
+        resp = self.spot_wrapper.unstow()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_gipper_open(self, req):
+        """ROS service handler for opening the gripper"""
+        resp = self.spot_wrapper.gipper_open()
+        return TriggerResponse(resp[0], resp[1])
+    
+    def handle_gipper_close(self, req):
+        """ROS service handler for closing the gripper"""
+        resp = self.spot_wrapper.gipper_close()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_open_door(self, req):
+        """ROS service handler for opening the door"""
+        resp = self.spot_wrapper.open_door_main()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_cam_screen(self, req):
+        """ROS service handler for setting the cam screen"""
+        resp = self.spot_wrapper.set_screen(req.screen)
+        return SetScreenResponse(resp[0], resp[1])
+
+    def handle_cam_ptz(self, req):
+        """ROS service handler for controlling the cam ptz"""
+        resp = self.spot_wrapper.control_cam_ptz(req.pan, req.tilt, req.zoom)
+        return SetPTZResponse(resp[0], resp[1])
+
     def handle_start_recording(self, req):
         resp = self.spot_wrapper.start_recording()
         return TriggerResponse(resp[0], resp[1])
@@ -510,6 +593,17 @@ class SpotROS():
         else:
             self.navigate_as.set_aborted(NavigateToResult(resp[0], resp[1]))
 
+            self.navigate_as.set_aborted(NavigateToResult(resp[0], resp[1]))
+    
+    def handle_arm_cartesian(self, msg):
+        """ROS action server for arm cartesian command"""
+        resp = self.spot_wrapper.arm_cartesian(msg)
+
+        if resp[0]:
+            self.cartesian_as.set_succeeded(CartesianResult(resp[0], resp[1]))
+        else:
+            self.cartesian_as.set_aborted(CartesianResult(resp[0], resp[1]))
+
     def populate_camera_static_transforms(self, image_data):
         """Check data received from one of the image tasks and use the transform snapshot to extract the camera frame
         transforms. This is the transforms from body->frontleft->frontleft_fisheye, for example. These transforms
@@ -556,6 +650,10 @@ class SpotROS():
         self.password = rospy.get_param('~password', 'default_value')
         self.hostname = rospy.get_param('~hostname', 'default_value')
         self.motion_deadzone = rospy.get_param('~deadzone', 0.05)
+        self.estop_timeout = rospy.get_param('~estop_timeout', 9.0)
+        self.dock_id = rospy.get_param('~dock_id', 520)
+        self.has_arm = rospy.get_param('~has_arm', False)
+        self.has_cam = rospy.get_param('~has_cam', False)
 
         self.camera_static_transform_broadcaster = tf2_ros.StaticTransformBroadcaster()
         # Static transform broadcaster is super simple and just a latched publisher. Every time we add a new static
@@ -579,7 +677,7 @@ class SpotROS():
         self.logger = logging.getLogger('rosout')
 
         rospy.loginfo("Starting ROS driver for Spot")
-        self.spot_wrapper = SpotWrapper(self.username, self.password, self.hostname, self.logger, self.rates, self.callbacks)
+        self.spot_wrapper = SpotWrapper(self.username, self.password, self.hostname, self.logger, self.estop_timeout, self.dock_id, self.has_arm, self.has_cam, self.rates, self.callbacks)
 
         if self.spot_wrapper.is_valid:
             # Images #
@@ -663,6 +761,24 @@ class SpotROS():
             rospy.Service("dock", Dock, self.handle_dock)
             rospy.Service("undock", Trigger, self.handle_undock)
 
+            if self.has_arm:
+                rospy.Service("arm/stow", Trigger, self.handle_stow)
+                rospy.Service("arm/unstow", Trigger, self.handle_unstow)
+                rospy.Service("gripper/open", Trigger, self.handle_gipper_open)
+                rospy.Service("gripper/close", Trigger, self.handle_gipper_close)
+                rospy.Service("arm/open_door", Trigger, self.handle_open_door)
+                self.hand_image_pub = rospy.Publisher('camera/hand/image', Image, queue_size=10)
+                self.hand_depth_pub = rospy.Publisher('depth/hand/image', Image, queue_size=10)
+                self.hand_image_info_pub = rospy.Publisher('camera/hand/camera_info', CameraInfo, queue_size=10)
+                self.hand_depth_info_pub = rospy.Publisher('depth/hand/camera_info', CameraInfo, queue_size=10)
+
+            if self.has_cam:
+                self.cam_pub = rospy.Publisher('spot_cam/state', CamState, queue_size=10)
+                rospy.Service("spot_cam/screen", SetScreen, self.handle_cam_screen)
+                rospy.Service("spot_cam/ptz", SetPTZ, self.handle_cam_ptz)
+                self.cam_state = CamState()
+                self.cam_state.header.frame_id = 'spot_cam'
+
 
             self.navigate_as = actionlib.SimpleActionServer('navigate_to', NavigateToAction,
                                                             execute_cb = self.handle_navigate_to,
@@ -673,6 +789,12 @@ class SpotROS():
                                                                   execute_cb=self.handle_trajectory,
                                                                   auto_start=False)
             self.trajectory_server.start()
+
+            if self.has_arm:
+                self.cartesian_as = actionlib.SimpleActionServer('arm_cartesian', CartesianAction,
+                                                                  execute_cb=self.handle_arm_cartesian,
+                                                                  auto_start=False)
+                self.cartesian_as.start()
 
             rospy.on_shutdown(self.shutdown)
 

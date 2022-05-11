@@ -32,6 +32,9 @@ add_message_files(
   LeaseResource.msg
   PowerState.msg
   SystemFaultState.msg
+  ScreenState.msg
+  PTZState.msg
+  CamState.msg
 )
 
 add_service_files(
@@ -45,12 +48,15 @@ add_service_files(
   ClearBehaviorFault.srv
   UploadGraph.srv
   Dock.srv
+  SetPTZ.srv
+  SetScreen.srv
 )
 
 add_action_files(
   FILES
   NavigateTo.action
   Trajectory.action
+  Cartesian.action
 )
 
 generate_messages(

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from spot_driver.webrtc_ros import WebRTCROS
+
+if __name__ == "__main__":
+    WR= WebRTCROS()
+    WR.main()
