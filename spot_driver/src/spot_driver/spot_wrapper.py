@@ -885,7 +885,7 @@ class SpotWrapper():
         self._last_velocity_command_time = end_time
         return response[0], response[1]
 
-    def trajectory_cmd(self, goal_x, goal_y, goal_heading, cmd_duration, frame_name='odom', precise_position=False):
+    def trajectory_cmd(self, goal_x, goal_y, goal_heading, cmd_duration, frame_name='vision', precise_position=True):
         """Send a trajectory motion command to the robot.
 
         Args:
